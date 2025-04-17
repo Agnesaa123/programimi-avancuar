@@ -1,4 +1,3 @@
-
 const { createUser, getUserById, updateUser, getCurrentUser } = require('../services/userService');
 
 // Create a new user

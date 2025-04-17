@@ -1,241 +1,150 @@
-// user-profile-service/server.js
 const express = require('express');
-const bodyParser = require('body-parser');
+const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const bcrypt = require('bcrypt');
-const { v4: uuidv4 } = require('uuid');
+const { createClient } = require('@supabase/supabase-js');
+require('dotenv').config();
 
-// Initialize Express
 const app = express();
+app.use(express.json()); // E RËNDËSISHME: për të lexuar req.body si JSON
+
+// ✅ Supabase konfigurimi
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_KEY;
+const supabase = createClient(supabaseUrl, supabaseKey);
+
 const PORT = process.env.PORT || 3000;
-const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key'; // Use env variable in production
+const SECRET_KEY = process.env.JWT_SECRET || 'jwt_secret_key';
 
-// Middleware
-app.use(express.json());  // Ensure that we can parse JSON data in requests
-
-// In-memory user storage (replace with database in production)
-const users = [];
-
-// ===== HELPER FUNCTIONS =====
-
-// Find user by ID
-const findUserById = (id) => {
-  return users.find(user => user.id === id);
-};
-
-// Find user by email
-const findUserByEmail = (email) => {
-  return users.find(user => user.email === email);
-};
-
-// Validate email format
-const isValidEmail = (email) => {
-  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-  return emailRegex.test(email);
-};
-
-// Validate password strength
-const isStrongPassword = (password) => {
-  return password.length >= 8; // Add more rules as needed
-};
-
-// Authentication middleware
-const authenticateToken = (req, res, next) => {
+// ✅ Middleware për verifikimin e tokenit
+function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
-  
-  if (!token) {
-    return res.status(401).json({ error: 'Authentication token required' });
-  }
+  if (!token) return res.status(401).json({ error: 'Access token required' });
 
-  jwt.verify(token, JWT_SECRET, (err, user) => {
-    if (err) {
-      return res.status(403).json({ error: 'Invalid or expired token' });
-    }
-    
+  jwt.verify(token, SECRET_KEY, (err, user) => {
+    if (err) return res.status(403).json({ error: 'Invalid token' });
     req.user = user;
     next();
   });
-};
+}
 
-// ===== ROUTES =====
-
-// Health check endpoint
-app.get('/health', (req, res) => {
-  res.status(200).json({ status: 'UP', service: 'user-profile-service' });
-});
-
-// POST /users - Create a new user
+// ✅ Regjistrimi i përdoruesit
 app.post('/users', async (req, res) => {
-  const { email, password, name, address } = req.body;
+  console.log('REQ BODY:', req.body); // për debug
 
-  // Validate inputs
-  if (!email || !password || !name || !address) {
-    return res.status(400).json({ error: 'All fields are required' });
+  const { email, password, name } = req.body;
+
+  const missingFields = [];
+  if (!email || email.trim() === '') missingFields.push('email');
+  if (!password || password.trim() === '') missingFields.push('password');
+  if (!name || name.trim() === '') missingFields.push('name');
+
+  if (missingFields.length > 0) {
+    return res.status(400).json({
+      error: {
+        message: `Fushat që mungojnë: ${missingFields.join(', ')}`,
+        code: 400
+      }
+    });
   }
 
-  // Validate email format
-  if (!isValidEmail(email)) {
-    return res.status(400).json({ error: 'Invalid email format' });
+  const { data: existingUser, error: checkError } = await supabase
+    .from('users')
+    .select('*')
+    .eq('email', email)
+    .limit(1);
+
+  if (checkError) {
+    return res.status(500).json({ error: 'Database error', details: checkError.message });
   }
 
-  // Validate password strength
-  if (!isStrongPassword(password)) {
-    return res.status(400).json({ error: 'Password must be at least 8 characters long' });
+  if (existingUser && existingUser.length > 0) {
+    return res.status(400).json({ error: 'User already exists' });
   }
 
-  // Check if email is already used
-  if (findUserByEmail(email)) {
-    return res.status(400).json({ error: 'Email already in use' });
-  }
-
-  // Hash password
   const hashedPassword = await bcrypt.hash(password, 10);
 
-  // Create user
-  const newUser = {
-    id: uuidv4(),
-    email,
-    password: hashedPassword,
-    name,
-    address,
-    registrationDate: new Date().toISOString(),
-    lastLogin: null,
-  };
+  const { data, error } = await supabase
+    .from('users')
+    .insert([{ email, name, password: hashedPassword }])
+    .select();
 
-  // Store user
-  users.push(newUser);
+  if (error) {
+    return res.status(500).json({ error: 'Database insert error', details: error.message });
+  }
 
-  res.status(201).json({
-    id: newUser.id,
-    email: newUser.email,
-    name: newUser.name,
-    address: newUser.address,
-    registrationDate: newUser.registrationDate,
-  });
+  res.status(201).json({ message: 'User registered successfully', user: data[0] });
 });
 
-// POST /auth/login - Authenticate user and generate JWT
+// ✅ Autentifikimi
 app.post('/auth/login', async (req, res) => {
   const { email, password } = req.body;
 
-  // Validate inputs
-  if (!email || !password) {
-    return res.status(400).json({ error: 'Email and password are required' });
+  const missing = [];
+  if (!email) missing.push('email');
+  if (!password) missing.push('password');
+
+  if (missing.length > 0) {
+    return res.status(400).json({
+      error: {
+        message: `Fushat që mungojnë: ${missing.join(', ')}`,
+        code: 400
+      }
+    });
   }
 
-  // Find user by email
-  const user = findUserByEmail(email);
-  if (!user) {
+  const { data: users, error } = await supabase
+    .from('users')
+    .select('*')
+    .eq('email', email)
+    .limit(1);
+
+  if (error) {
+    return res.status(500).json({ error: 'Database error', details: error.message });
+  }
+
+  if (!users || users.length === 0) {
     return res.status(401).json({ error: 'Invalid credentials' });
   }
 
-  // Check password
-  const validPassword = await bcrypt.compare(password, user.password);
-  if (!validPassword) {
+  const user = users[0];
+  const isMatch = await bcrypt.compare(password, user.password);
+
+  if (!isMatch) {
     return res.status(401).json({ error: 'Invalid credentials' });
   }
 
-  // Generate JWT
-  const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '24h' });
+  await supabase
+    .from('users')
+    .update({ last_login: new Date().toISOString() })
+    .eq('id', user.id);
 
-  res.status(200).json({
-    token,
-    userId: user.id,
-  });
+  const token = jwt.sign({ userId: user.id }, SECRET_KEY, { expiresIn: '24h' });
+
+  res.status(200).json({ token, userId: user.id });
 });
 
-// GET /users/me - Get current user profile (protected)
-app.get('/users/me', authenticateToken, (req, res) => {
-  const user = findUserById(req.user.id);
-  if (!user) {
+// ✅ Profili i përdoruesit të loguar
+app.get('/users/me', authenticateToken, async (req, res) => {
+  const { data: users, error } = await supabase
+    .from('users')
+    .select('id, name, email, created_at, last_login')
+    .eq('id', req.user.userId)
+    .limit(1);
+
+  if (error || !users || users.length === 0) {
     return res.status(404).json({ error: 'User not found' });
   }
 
-  res.status(200).json({
-    id: user.id,
-    email: user.email,
-    name: user.name,
-    address: user.address,
-    registrationDate: user.registrationDate,
-    lastLogin: user.lastLogin,
-  });
+  res.json(users[0]);
 });
 
-// GET /users/:id - Get user by ID (protected)
-app.get('/users/:id', authenticateToken, (req, res) => {
-  const user = findUserById(req.params.id);
-  if (!user) {
-    return res.status(404).json({ error: 'User not found' });
-  }
-
-  res.status(200).json({
-    id: user.id,
-    email: user.email,
-    name: user.name,
-    address: user.address,
-    registrationDate: user.registrationDate,
-    lastLogin: user.lastLogin,
-  });
+// ✅ Health Check
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'OK' });
 });
 
-// PUT /users/:id - Update user details (protected)
-app.put('/users/:id', authenticateToken, async (req, res) => {
-  const { id } = req.params;
-  const { name, address } = req.body;
-
-  // Find user by ID
-  const user = findUserById(id);
-  if (!user) {
-    return res.status(404).json({ error: 'User not found' });
-  }
-
-  // Ensure the current user is the one being updated
-  if (user.id !== req.user.id) {
-    return res.status(403).json({ error: 'You are not authorized to update this profile' });
-  }
-
-  // Update user details
-  user.name = name || user.name;
-  user.address = address || user.address;
-
-  res.status(200).json({
-    id: user.id,
-    email: user.email,
-    name: user.name,
-    address: user.address,
-    registrationDate: user.registrationDate,
-    lastLogin: user.lastLogin,
-  });
-});
-
-// DELETE /users/:id - Delete user (protected)
-app.delete('/users/:id', authenticateToken, (req, res) => {
-  const { id } = req.params;
-
-  // Find user by ID
-  const userIndex = users.findIndex(user => user.id === id);
-  if (userIndex === -1) {
-    return res.status(404).json({ error: 'User not found' });
-  }
-
-  // Ensure the current user is the one being deleted
-  if (users[userIndex].id !== req.user.id) {
-    return res.status(403).json({ error: 'You are not authorized to delete this profile' });
-  }
-
-  // Delete the user
-  users.splice(userIndex, 1);
-
-  res.status(200).json({ message: 'User deleted successfully' });
-});
-// GET / - Ruga kryesore (home route)
-app.get('/', (req, res) => {
-    res.status(200).json({ message: 'Welcome to the User Profile Service!' });
-  });
-  
-// Start the server
+// ✅ Startimi i serverit
 app.listen(PORT, () => {
-    console.log(`User Profile Service running on port ${PORT}`);
-  });
-  
+  console.log(`🚀 Server running on http://localhost:${PORT}`);
+});
